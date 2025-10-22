@@ -14,12 +14,18 @@
 (define-constant ERR-EQUIPMENT-NOT-AVAILABLE (err u108))
 (define-constant ERR-INVALID-STATUS (err u109))
 (define-constant ERR-PAYMENT-OVERDUE (err u110))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u111))
+(define-constant ERR-DISPUTE-ALREADY-EXISTS (err u112))
+(define-constant ERR-DISPUTE-ALREADY-RESOLVED (err u113))
+(define-constant ERR-DISPUTE-NOT-EXPIRED (err u114))
+(define-constant ERR-INVALID-DISPUTE-PARTY (err u115))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant PLATFORM-FEE-RATE u5)
 
 (define-data-var next-equipment-id uint u1)
 (define-data-var next-lease-id uint u1)
+(define-data-var next-dispute-id uint u1)
 (define-data-var platform-balance uint u0)
 
 (define-map equipment
@@ -66,6 +72,23 @@
     rating-count: uint,
     average-rating: uint
   })
+
+(define-map disputes
+  { dispute-id: uint }
+  {
+    lease-id: uint,
+    initiator: principal,
+    opponent: principal,
+    status: (string-ascii 20),
+    reason: (string-ascii 100),
+    created-block: uint,
+    resolved-block: uint,
+    winner: (optional principal)
+  })
+
+(define-map lease-disputes
+  { lease-id: uint }
+  { dispute-id: uint })
 
 (define-public (register-equipment (name (string-ascii 50)) (description (string-ascii 200)) (daily-rate uint) (deposit-required uint))
   (let ((equipment-id (var-get next-equipment-id)))
@@ -152,6 +175,7 @@
   )
     (asserts! (is-eq tx-sender (get lessee lease-data)) ERR-NOT-AUTHORIZED)
     (asserts! (is-eq (get status lease-data) "active") ERR-LEASE-INACTIVE)
+    (asserts! (is-none (map-get? lease-disputes { lease-id: lease-id })) ERR-INVALID-STATUS)
     (asserts! (<= condition-rating u5) ERR-INVALID-PARAMS)
     (asserts! (>= condition-rating u1) ERR-INVALID-PARAMS)
     
@@ -183,6 +207,7 @@
   )
     (asserts! (is-eq tx-sender (get lessee lease-data)) ERR-NOT-AUTHORIZED)
     (asserts! (is-eq (get status lease-data) "active") ERR-LEASE-INACTIVE)
+    (asserts! (is-none (map-get? lease-disputes { lease-id: lease-id })) ERR-INVALID-STATUS)
     (asserts! (< stacks-block-height (+ (get start-block lease-data) u144)) ERR-NOT-AUTHORIZED)
     
     (try! (as-contract (stx-transfer? refund-amount tx-sender (get lessee lease-data))))
@@ -232,6 +257,108 @@
     (var-set platform-balance u0)
     
     (ok balance)))
+
+(define-public (file-dispute (lease-id uint) (reason (string-ascii 100)))
+  (let
+    (
+      (lease-data (unwrap! (map-get? leases { lease-id: lease-id }) ERR-NOT-FOUND))
+      (caller tx-sender)
+      (dispute-id (var-get next-dispute-id))
+      (existing-dispute (map-get? lease-disputes { lease-id: lease-id }))
+    )
+    (asserts! (is-eq (get status lease-data) "active") ERR-LEASE-INACTIVE)
+    (asserts! (is-none existing-dispute) ERR-DISPUTE-ALREADY-EXISTS)
+    (asserts! (or (is-eq caller (get lessor lease-data)) (is-eq caller (get lessee lease-data))) ERR-INVALID-DISPUTE-PARTY)
+    
+    (let
+      (
+        (opponent (if (is-eq caller (get lessor lease-data)) (get lessee lease-data) (get lessor lease-data)))
+      )
+      (map-set disputes
+        { dispute-id: dispute-id }
+        {
+          lease-id: lease-id,
+          initiator: caller,
+          opponent: opponent,
+          status: "pending",
+          reason: reason,
+          created-block: stacks-block-height,
+          resolved-block: u0,
+          winner: none
+        }
+      )
+      (map-set lease-disputes
+        { lease-id: lease-id }
+        { dispute-id: dispute-id }
+      )
+      (var-set next-dispute-id (+ dispute-id u1))
+      (ok dispute-id)
+    )
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (winner principal))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+      (lease-data (unwrap! (map-get? leases { lease-id: (get lease-id dispute-data) }) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq (get status dispute-data) "pending") ERR-DISPUTE-ALREADY-RESOLVED)
+    (asserts! (or (is-eq winner (get initiator dispute-data)) (is-eq winner (get opponent dispute-data))) ERR-INVALID-DISPUTE-PARTY)
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    (let
+      (
+        (winner-status (if (is-eq winner (get lessor lease-data)) "lessor-win" "lessee-win"))
+        (dispute-funds (get total-cost lease-data))
+      )
+      (map-set disputes
+        { dispute-id: dispute-id }
+        (merge dispute-data {
+          status: winner-status,
+          resolved-block: stacks-block-height,
+          winner: (some winner)
+        })
+      )
+      (map-delete lease-disputes { lease-id: (get lease-id dispute-data) })
+      
+      (try! (as-contract (stx-transfer? dispute-funds tx-sender winner)))
+      (ok true)
+    )
+  )
+)
+
+(define-public (auto-expire-dispute (dispute-id uint))
+  (let
+    (
+      (dispute-data (unwrap! (map-get? disputes { dispute-id: dispute-id }) ERR-DISPUTE-NOT-FOUND))
+      (lease-data (unwrap! (map-get? leases { lease-id: (get lease-id dispute-data) }) ERR-NOT-FOUND))
+      (blocks-passed (- stacks-block-height (get created-block dispute-data)))
+    )
+    (asserts! (is-eq (get status dispute-data) "pending") ERR-DISPUTE-ALREADY-RESOLVED)
+    (asserts! (>= blocks-passed u72) ERR-DISPUTE-NOT-EXPIRED)
+    
+    (map-set disputes
+      { dispute-id: dispute-id }
+      (merge dispute-data {
+        status: "expired",
+        resolved-block: stacks-block-height,
+        winner: none
+      })
+    )
+    (map-delete lease-disputes { lease-id: (get lease-id dispute-data) })
+    
+    (let
+      (
+        (dispute-funds (get total-cost lease-data))
+        (half-payment (/ dispute-funds u2))
+      )
+      (try! (as-contract (stx-transfer? half-payment tx-sender (get lessor lease-data))))
+      (try! (as-contract (stx-transfer? half-payment tx-sender (get lessee lease-data))))
+      (ok true)
+    )
+  )
+)
 
 (define-private (update-equipment-rating (equipment-id uint) (rating uint))
   (let (
@@ -293,10 +420,40 @@
     equipment-data (if (is-eq (get owner equipment-data) tx-sender) (+ count u1) count)
     count))
 
+(define-read-only (get-dispute (dispute-id uint))
+  (map-get? disputes { dispute-id: dispute-id }))
+
+(define-read-only (is-dispute-active (lease-id uint))
+  (match (map-get? lease-disputes { lease-id: lease-id })
+    dispute-id-data
+    (match (map-get? disputes { dispute-id: (get dispute-id dispute-id-data) })
+      dispute-data
+      (is-eq (get status dispute-data) "pending")
+      false
+    )
+    false
+  )
+)
+
+(define-read-only (get-dispute-time-remaining (dispute-id uint))
+  (match (map-get? disputes { dispute-id: dispute-id })
+    dispute-data
+    (let
+      (
+        (blocks-passed (- stacks-block-height (get created-block dispute-data)))
+        (blocks-remaining (if (< blocks-passed u72) (- u72 blocks-passed) u0))
+      )
+      (ok blocks-remaining)
+    )
+    (err ERR-DISPUTE-NOT-FOUND)
+  )
+)
+
 (define-read-only (get-platform-stats)
   {
     total-equipment: (- (var-get next-equipment-id) u1),
     total-leases: (- (var-get next-lease-id) u1),
+    total-disputes: (- (var-get next-dispute-id) u1),
     platform-balance: (var-get platform-balance),
     platform-fee-rate: PLATFORM-FEE-RATE
   })
