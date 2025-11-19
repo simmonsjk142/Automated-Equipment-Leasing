@@ -19,6 +19,10 @@
 (define-constant ERR-DISPUTE-ALREADY-RESOLVED (err u113))
 (define-constant ERR-DISPUTE-NOT-EXPIRED (err u114))
 (define-constant ERR-INVALID-DISPUTE-PARTY (err u115))
+(define-constant ERR-INSURANCE-NOT-ACTIVE (err u116))
+(define-constant ERR-CLAIM-NOT-FOUND (err u117))
+(define-constant ERR-INVALID-CLAIM-SEVERITY (err u118))
+(define-constant ERR-INSUFFICIENT-ESCROW (err u119))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant PLATFORM-FEE-RATE u5)
@@ -26,6 +30,7 @@
 (define-data-var next-equipment-id uint u1)
 (define-data-var next-lease-id uint u1)
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-claim-id uint u1)
 (define-data-var platform-balance uint u0)
 
 (define-map equipment
@@ -89,6 +94,27 @@
 (define-map lease-disputes
   { lease-id: uint }
   { dispute-id: uint })
+
+(define-map equipment-insurance
+  { equipment-id: uint }
+  { escrow-balance: uint })
+
+(define-map lease-insurance
+  { lease-id: uint }
+  { active: bool })
+
+(define-map damage-claims
+  { claim-id: uint }
+  {
+    lessor: principal,
+    lessee: principal,
+    equipment-id: uint,
+    lease-id: uint,
+    severity: uint,
+    amount: uint,
+    status: (string-ascii 20),
+    created-block: uint
+  })
 
 (define-public (register-equipment (name (string-ascii 50)) (description (string-ascii 200)) (daily-rate uint) (deposit-required uint))
   (let ((equipment-id (var-get next-equipment-id)))
@@ -377,6 +403,114 @@
       })
     (ok true)))
 
+(define-public (enable-insurance (lease-id uint))
+  (let (
+    (lease-data (unwrap! (map-get? leases { lease-id: lease-id }) ERR-NOT-FOUND))
+    (equipment-id (get equipment-id lease-data))
+    (premium (/ (get total-cost lease-data) u10))
+    (current-escrow (default-to { escrow-balance: u0 }
+      (map-get? equipment-insurance { equipment-id: equipment-id })))
+  )
+    (asserts! (is-eq tx-sender (get lessee lease-data)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status lease-data) "active") ERR-LEASE-INACTIVE)
+    (asserts! (is-none (map-get? lease-insurance { lease-id: lease-id })) ERR-ALREADY-EXISTS)
+    (asserts! (>= (stx-get-balance tx-sender) premium) ERR-INSUFFICIENT-FUNDS)
+    
+    (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+    
+    (map-set equipment-insurance
+      { equipment-id: equipment-id }
+      { escrow-balance: (+ (get escrow-balance current-escrow) premium) })
+    
+    (map-set lease-insurance
+      { lease-id: lease-id }
+      { active: true })
+    
+    (ok true)))
+
+(define-public (file-damage-claim (lease-id uint) (severity uint) (amount uint))
+  (let (
+    (lease-data (unwrap! (map-get? leases { lease-id: lease-id }) ERR-NOT-FOUND))
+    (equipment-id (get equipment-id lease-data))
+    (claim-id (var-get next-claim-id))
+    (caller tx-sender)
+  )
+    (asserts! (is-some (map-get? lease-insurance { lease-id: lease-id })) ERR-INSURANCE-NOT-ACTIVE)
+    (asserts! (or (is-eq caller (get lessor lease-data)) (is-eq caller (get lessee lease-data))) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= severity u1) (<= severity u3)) ERR-INVALID-CLAIM-SEVERITY)
+    (asserts! (> amount u0) ERR-INVALID-PARAMS)
+    
+    (let
+      (
+        (opponent (if (is-eq caller (get lessor lease-data)) (get lessee lease-data) (get lessor lease-data)))
+      )
+      (map-set damage-claims
+        { claim-id: claim-id }
+        {
+          lessor: (get lessor lease-data),
+          lessee: (get lessee lease-data),
+          equipment-id: equipment-id,
+          lease-id: lease-id,
+          severity: severity,
+          amount: amount,
+          status: "pending",
+          created-block: stacks-block-height
+        }
+      )
+      (var-set next-claim-id (+ claim-id u1))
+      (ok claim-id)
+    )
+  )
+)
+
+(define-public (resolve-damage-claim (claim-id uint) (approved bool))
+  (let (
+    (claim-data (unwrap! (map-get? damage-claims { claim-id: claim-id }) ERR-CLAIM-NOT-FOUND))
+    (equipment-id (get equipment-id claim-data))
+    (escrow-data (unwrap! (map-get? equipment-insurance { equipment-id: equipment-id }) ERR-INSUFFICIENT-ESCROW))
+    (lessor (get lessor claim-data))
+    (lessee (get lessee claim-data))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status claim-data) "pending") ERR-INVALID-STATUS)
+    
+    (if approved
+      (let (
+        (payout (if (> (get amount claim-data) (get escrow-balance escrow-data))
+                   (get escrow-balance escrow-data)
+                   (get amount claim-data)))
+      )
+        (try! (as-contract (stx-transfer? payout tx-sender lessor)))
+        (map-set equipment-insurance
+          { equipment-id: equipment-id }
+          { escrow-balance: (- (get escrow-balance escrow-data) payout) })
+      )
+      (try! (as-contract (stx-transfer? (get amount claim-data) tx-sender lessee)))
+    )
+    
+    (map-set damage-claims
+      { claim-id: claim-id }
+      (merge claim-data { status: "resolved" }))
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-insurance-balance (equipment-id uint))
+  (let ((escrow-data (unwrap! (map-get? equipment-insurance { equipment-id: equipment-id }) ERR-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> (get escrow-balance escrow-data) u0) ERR-INSUFFICIENT-FUNDS)
+    
+    (let ((balance (get escrow-balance escrow-data)))
+      (try! (as-contract (stx-transfer? balance tx-sender CONTRACT-OWNER)))
+      (map-set equipment-insurance
+        { equipment-id: equipment-id }
+        { escrow-balance: u0 })
+      (ok balance)
+    )
+  )
+)
+
 (define-read-only (get-equipment (equipment-id uint))
   (map-get? equipment { equipment-id: equipment-id }))
 
@@ -457,3 +591,15 @@
     platform-balance: (var-get platform-balance),
     platform-fee-rate: PLATFORM-FEE-RATE
   })
+
+(define-read-only (get-insurance-status (lease-id uint))
+  (map-get? lease-insurance { lease-id: lease-id }))
+
+(define-read-only (get-escrow-balance (equipment-id uint))
+  (map-get? equipment-insurance { equipment-id: equipment-id }))
+
+(define-read-only (get-damage-claim (claim-id uint))
+  (map-get? damage-claims { claim-id: claim-id }))
+
+(define-read-only (calculate-insurance-premium (total-lease-cost uint))
+  (ok (/ total-lease-cost u10)))
